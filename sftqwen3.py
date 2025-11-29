@@ -166,7 +166,7 @@ collator_with_debug = DataCollatorWithDebugging(tokenizer=tokenizer)
 
 training_args = TrainingArguments(
     output_dir=f"./{new_model_name}-results",
-    per_device_train_batch_size=2,
+    per_device_train_batch_size=32,
     gradient_accumulation_steps=4,
     learning_rate=2e-4,
     num_train_epochs=3,

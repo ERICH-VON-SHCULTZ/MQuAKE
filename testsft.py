@@ -11,45 +11,77 @@ from tqdm import tqdm
 import re
 from typing import List, Dict, Any
 
-# --- 1. 配置 ---
+# --- 1. Configuration ---
 BASE_MODEL_NAME = "Qwen/Qwen3-8B"
 LORA_ADAPTER_PATH = "./qwen3-8b-implicit-knowledge-update" 
 DATASET_PATH = "/scratch/yw8866/MQuAKE/datasets/MQuAKE-T.json" 
-THINK_TOKEN_ID = 151668 # </think>
+
+# Special tokens
+THINK_START_TOKEN = "<think>"
+THINK_END_TOKEN = "</think>"
+
+# Global Thinking Toggle
 GLOBAL_ENABLE_THINKING = False
 
-EVAL_BATCH_SIZE = 64
+# Batch size & Generation Limits
+EVAL_BATCH_SIZE = 32
+# Increased max tokens to prevent cutting off thoughts
+MAX_NEW_TOKENS = 1024 
 
-# --- 2. 辅助函数 (清理/检查) ---
+# 🌟 TEST MODE SETTINGS 🌟
+TEST_MODE = False       
+TEST_SAMPLE_SIZE = 100 
 
-def clean_answer(text):
-    text = text.strip()
-    text = re.sub(r"^[.,'\" ]+", "", text)
-    text = re.sub(r"[.,'\" ]+$", "", text)
-    return text
+# --- 2. Helper Functions (Robust Matching) ---
+
+def normalize_answer(s):
+    """
+    Lower text and remove punctuation, articles and extra whitespace.
+    """
+    s = str(s).lower().strip()
+    
+    # Remove punctuation
+    s = re.sub(r'[^\w\s]', '', s)
+    
+    # Remove common articles (optional, but helps with 'The United States' vs 'United States')
+    # s = re.sub(r'\b(a|an|the)\b', ' ', s)
+    
+    return " ".join(s.split())
 
 def check_answer(generated_answer, expected_answer, aliases):
-    if generated_answer == expected_answer:
+    """
+    Robust check: Returns True if the expected answer (or alias) 
+    is CONTAINED inside the generated answer.
+    """
+    gen_norm = normalize_answer(generated_answer)
+    exp_norm = normalize_answer(expected_answer)
+    
+    # 1. Direct containment check (e.g., "Joe Biden" in "The president is Joe Biden")
+    if exp_norm in gen_norm:
         return True
-    if aliases and generated_answer in aliases:
-        return True
-    if generated_answer.startswith(expected_answer):
-        return True
+        
+    # 2. Alias containment check
+    if aliases:
+        for alias in aliases:
+            alias_norm = normalize_answer(alias)
+            if alias_norm and alias_norm in gen_norm:
+                return True
+    
     return False
 
-# --- 3. 🌟 新的批量推理函数 🌟 ---
+# --- 3. Batch Inference Function (Improved Parsing) ---
 
 def get_batch_responses(model, tokenizer, prompts: List[str], enable_thinking=False) -> List[Dict[str, str]]:
     """
-    核心的批量生成函数。
+    Core batch generation function with robust CoT parsing.
     """
     all_responses = []
     
-    # 将长列表分成小批次
-    for i in tqdm(range(0, len(prompts), EVAL_BATCH_SIZE), desc=f"Batch Inference (thinking={enable_thinking})"):
+    # Process in chunks
+    for i in tqdm(range(0, len(prompts), EVAL_BATCH_SIZE), desc=f"Batch Inference (think={enable_thinking})"):
         batch_prompts = prompts[i:i+EVAL_BATCH_SIZE]
         
-        # 1. 准备批量聊天模板
+        # 1. Prepare chat template
         batch_messages = [[{"role": "user", "content": p}] for p in batch_prompts]
         
         try:
@@ -60,56 +92,75 @@ def get_batch_responses(model, tokenizer, prompts: List[str], enable_thinking=Fa
                 enable_thinking=enable_thinking 
             )
             
-            # 2. 批量 Tokenize
+            # 2. Batch Tokenize (Left Padding for Inference!)
             model_inputs = tokenizer(
                 texts, 
                 return_tensors="pt", 
                 padding=True, 
                 truncation=True, 
-                max_length=1024
+                max_length=2048 # Increased context length
             ).to(model.device)
             
-            # 3. 批量生成
+            # 3. Batch Generate
             generated_ids = model.generate(
                 **model_inputs,
-                max_new_tokens=256,
+                max_new_tokens=MAX_NEW_TOKENS,
                 pad_token_id=tokenizer.pad_token_id
             )
             
-            # 4. 批量解码 (逐个解析)
+            # 4. Batch Decode
             input_ids_len = model_inputs.input_ids.shape[1]
-            batch_output_ids = generated_ids[:, input_ids_len:].tolist()
+            batch_output_ids = generated_ids[:, input_ids_len:]
 
-            for output_ids in batch_output_ids:
+            # Decode full text including special tokens to catch <think> tags
+            decoded_texts = tokenizer.batch_decode(batch_output_ids, skip_special_tokens=False)
+
+            for raw_text in decoded_texts:
                 thinking_content = ""
-                final_answer = ""
+                final_answer = raw_text
 
+                # 🌟 Robust CoT Parsing Logic (String-based) 🌟
                 if enable_thinking:
-                    try:
-                        index = len(output_ids) - output_ids[::-1].index(THINK_TOKEN_ID)
-                        thinking_content = tokenizer.decode(output_ids[:index], skip_special_tokens=True).strip()
-                        final_answer = tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip()
-                    except ValueError:
-                        final_answer = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-                else:
-                    final_answer = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+                    # Clean up the output string first
+                    clean_raw = raw_text.strip()
+                    
+                    # Case A: Standard </think> split
+                    if THINK_END_TOKEN in clean_raw:
+                        parts = clean_raw.split(THINK_END_TOKEN)
+                        thinking_content = parts[0].replace(THINK_START_TOKEN, "").strip()
+                        # Everything after </think> is the answer
+                        final_answer = parts[1].strip()
+                    
+                    # Case B: <think> exists but no </think> (Cut off)
+                    elif THINK_START_TOKEN in clean_raw:
+                        thinking_content = clean_raw.replace(THINK_START_TOKEN, "").strip()
+                        final_answer = "[INCOMPLETE_GENERATION]" # Model didn't finish thinking
+                    
+                    # Case C: No <think> tags found (Model skipped thinking)
+                    else:
+                        final_answer = clean_raw
+
+                # Remove other special tokens (like <|im_end|>) from the final answer
+                final_answer = re.sub(r'<\|.*?\|>', '', final_answer).strip()
 
                 all_responses.append({
                     "thinking": thinking_content,
-                    "answer": clean_answer(final_answer)
+                    "answer": final_answer, # This is the extracted text for checking
+                    "raw_output": raw_text  # For debug printing
                 })
 
         except Exception as e:
-            print(f"处理批次时出错: {e}")
-            # 为失败的批次添加空响应
-            all_responses.extend([{"thinking": "", "answer": ""}] * len(batch_prompts))
+            print(f"Error processing batch: {e}")
+            import traceback
+            traceback.print_exc()
+            all_responses.extend([{"thinking": "", "answer": "", "raw_output": "ERROR"}] * len(batch_prompts))
             
     return all_responses
 
-# --- 4. 主评估函数 (重构) ---
+# --- 4. Main Evaluation Function ---
 
 def main():
-    print(f"--- 1. 加载模型: {BASE_MODEL_NAME} ---")
+    print(f"--- 1. Loading Model: {BASE_MODEL_NAME} ---")
     
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -126,21 +177,27 @@ def main():
         trust_remote_code=True
     )
     
+    # Padding side LEFT for inference
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME, trust_remote_code=True, padding_side='left')
-    tokenizer.pad_token_id = 151643
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = 151643
 
-    print(f"--- 2. 合并 LoRA 权重: {LORA_ADAPTER_PATH} ---")
+    print(f"--- 2. Merging LoRA Adapter: {LORA_ADAPTER_PATH} ---")
     try:
         model = PeftModel.from_pretrained(model, LORA_ADAPTER_PATH)
         model = model.merge_and_unload()
-        print("LoRA 权重合并成功。")
+        print("LoRA weights merged successfully.")
     except Exception as e:
-        print(f"合并 LoRA 权重失败: {e}\n警告：正在使用基础模型进行评估。")
+        print(f"Failed to merge LoRA weights: {e}\nWARNING: Running with Base Model.")
 
     model.eval()
 
-    print(f"--- 3. 加载并准备数据集: {DATASET_PATH} ---")
+    print(f"--- 3. Loading Dataset: {DATASET_PATH} ---")
     dataset = load_dataset("json", data_files=DATASET_PATH, split="train")
+
+    if TEST_MODE:
+        print(f"\n⚠️ TEST MODE ENABLED: Running on first {TEST_SAMPLE_SIZE} samples only.\n")
+        dataset = dataset.select(range(min(len(dataset), TEST_SAMPLE_SIZE)))
 
     metrics = {
         "edit_wise": {"correct": 0, "total": 0},
@@ -149,24 +206,23 @@ def main():
         "multi_hop_cot": {"correct": 0, "total": 0}
     }
     
-    # 🌟 步骤 3.1: 准备所有评估任务
+    # Prepare evaluation tasks
     ew_prompts, ew_answers = [], []
     iw_prompt_groups, iw_answer_groups, iw_alias_groups = [], [], []
     mh_prompts, mh_answers, mh_aliases = [], [], []
 
-    for data_point in tqdm(dataset, desc="准备评估数据"):
-        # 1. Edit-wise 任务
+    print("Preparing tasks...")
+    for data_point in dataset:
+        # 1. Edit-wise
         for rewrite in data_point["requested_rewrite"]:
             ew_prompts.append(rewrite["question"])
             ew_answers.append({"ans": rewrite["target_new"]["str"], "alias": []})
             metrics["edit_wise"]["total"] += 1
 
-        # 2. Instance-wise 任务 (分组)
+        # 2. Instance-wise
         if "new_single_hops" in data_point:
             metrics["instance_wise"]["total"] += 1
-            current_hop_prompts = []
-            current_hop_answers = []
-            current_hop_aliases = []
+            current_hop_prompts, current_hop_answers, current_hop_aliases = [], [], []
             for hop in data_point["new_single_hops"]:
                 current_hop_prompts.append(hop["question"])
                 current_hop_answers.append(hop["answer"])
@@ -175,7 +231,7 @@ def main():
             iw_answer_groups.append(current_hop_answers)
             iw_alias_groups.append(current_hop_aliases)
 
-        # 3. Multi-hop 任务
+        # 3. Multi-hop
         mh_prompts.append(data_point["questions"][0])
         mh_answers.append(data_point["new_answer"])
         mh_aliases.append(data_point.get("new_answer_alias", []))
@@ -183,22 +239,30 @@ def main():
         metrics["multi_hop_cot"]["total"] += 1
 
 
-    print("--- 4. 开始批量评估 ---")
+    print("--- 4. Starting Evaluation ---")
 
-    # === 评估 1: Edit-wise Success ===
-    print("\n--- 正在运行: Edit-wise (事实记忆) ---")
+    # === 1. Edit-wise ===
+    print("\n--- Running: Edit-wise ---")
     ew_results = get_batch_responses(model, tokenizer, ew_prompts, enable_thinking=GLOBAL_ENABLE_THINKING)
+    
     for i, res in enumerate(ew_results):
-        if check_answer(res["answer"], ew_answers[i]["ans"], ew_answers[i]["alias"]):
+        is_correct = check_answer(res["answer"], ew_answers[i]["ans"], ew_answers[i]["alias"])
+        if is_correct:
             metrics["edit_wise"]["correct"] += 1
+        
+        if TEST_MODE:
+            status = "✅ PASS" if is_correct else "❌ FAIL"
+            print(f"\n[Edit-wise #{i}] {status}")
+            print(f"Q: {ew_prompts[i]}")
+            print(f"Got: {res['answer']}")
+            print(f"Exp: {ew_answers[i]['ans']}")
+            if not is_correct: print(f"Raw: {res['raw_output'][:100]}...")
 
-    # === 评估 2: Instance-wise Accuracy ===
-    print("\n--- 正在运行: Instance-wise (链条记忆) ---")
-    # 1. 展平所有任务 (Flatten all tasks)
+    # === 2. Instance-wise ===
+    print("\n--- Running: Instance-wise ---")
     all_iw_prompts = []
     all_iw_expected_answers = []
     all_iw_aliases = []
-    # 这个列表用于追踪每个 hop 属于哪个原始实例 (instance_id)
     all_iw_group_indices = [] 
     
     for instance_id, prompt_group in enumerate(iw_prompt_groups):
@@ -206,80 +270,79 @@ def main():
             all_iw_prompts.append(prompt)
             all_iw_expected_answers.append(iw_answer_groups[instance_id][hop_index])
             all_iw_aliases.append(iw_alias_groups[instance_id][hop_index])
-            all_iw_group_indices.append(instance_id) # 追踪 instance_id
+            all_iw_group_indices.append(instance_id)
 
-    # 2. 一次性运行所有 'hop' 的批量推理
-    # 这是真正的批量优化，GPU 利用率会很高
     all_iw_results = get_batch_responses(
         model, tokenizer, all_iw_prompts, 
         enable_thinking=GLOBAL_ENABLE_THINKING
     )
 
-    # 3. 重新组合结果 (在 CPU 上快速完成)
     num_instances = len(iw_prompt_groups)
-    # 初始化一个列表，假设所有实例都正确
     instance_correct_tracker = [True] * num_instances
-    
-    # 遍历所有 hops 的结果
-    for i, result in enumerate(tqdm(all_iw_results, desc="Re-grouping Instance-wise")):
-        instance_id = all_iw_group_indices[i] # 找到这个 hop 属于哪个实例
-        
-        # 如果这个实例已经因为之前的 hop 失败了，就跳过检查 (小优化)
-        if not instance_correct_tracker[instance_id]:
-            continue
-            
-        expected_answer = all_iw_expected_answers[i]
+    if TEST_MODE: instance_logs = {idx: [] for idx in range(num_instances)}
+
+    for i, result in enumerate(all_iw_results):
+        instance_id = all_iw_group_indices[i]
+        expected = all_iw_expected_answers[i]
         aliases = all_iw_aliases[i]
         
-        # 检查这个 hop 是否正确
-        is_correct = check_answer(result["answer"], expected_answer, aliases)
-        
-        # 如果这个 hop 错了，就将整个实例标记为错误
+        is_correct = check_answer(result["answer"], expected, aliases)
         if not is_correct:
             instance_correct_tracker[instance_id] = False
-    
-    # 4. 统计最终结果
+        
+        if TEST_MODE:
+            symbol = "✅" if is_correct else "❌"
+            instance_logs[instance_id].append(f"{symbol} Q: {all_iw_prompts[i]} | Got: {result['answer']}")
+
+    if TEST_MODE:
+        for idx in range(num_instances):
+            status = "✅ PASS" if instance_correct_tracker[idx] else "❌ FAIL"
+            print(f"\n[Instance-wise #{idx}] {status}")
+            for log in instance_logs[idx]: print(log)
+
     metrics["instance_wise"]["correct"] = sum(instance_correct_tracker)
 
-    # === 评估 3: Multi-hop Accuracy (非 CoT) ===
-    print("\n--- 正在运行: Multi-hop (非 CoT) ---")
+    # === 3. Multi-hop (Standard) ===
+    print("\n--- Running: Multi-hop (Standard) ---")
     mh_results = get_batch_responses(model, tokenizer, mh_prompts, enable_thinking=GLOBAL_ENABLE_THINKING)
     for i, res in enumerate(mh_results):
-        if check_answer(res["answer"], mh_answers[i], mh_aliases[i]):
-            metrics["multi_hop"]["correct"] += 1
+        is_correct = check_answer(res["answer"], mh_answers[i], mh_aliases[i])
+        if is_correct: metrics["multi_hop"]["correct"] += 1
+        
+        if TEST_MODE:
+            status = "✅ PASS" if is_correct else "❌ FAIL"
+            print(f"\n[Multi-hop #{i}] {status}")
+            print(f"Q: {mh_prompts[i]}")
+            print(f"Got: {res['answer']}")
+            print(f"Exp: {mh_answers[i]}")
 
-    # === 评估 4: Multi-hop Accuracy (CoT / 'Thinking') ===
-    print("\n--- 正在运行: Multi-hop (CoT/Thinking) ---")
+    # === 4. Multi-hop (CoT) ===
+    print("\n--- Running: Multi-hop (CoT) ---")
     mh_cot_results = get_batch_responses(model, tokenizer, mh_prompts, enable_thinking=True)
     for i, res in enumerate(mh_cot_results):
-        if check_answer(res["answer"], mh_answers[i], mh_aliases[i]):
-            metrics["multi_hop_cot"]["correct"] += 1
-            
-    # 打印前 5 个 CoT 示例
-    print("\n--- 示例 CoT (Thinking) 结果 (前5) ---")
-    for i in range(min(5, len(mh_prompts))):
-        print(f"\n--- 示例 {i+1} (CoT 模式) ---")
-        print(f"Q: {mh_prompts[i]}")
-        print(f"THINKING:\n{mh_cot_results[i]['thinking']}")
-        print(f"A (模型): {mh_cot_results[i]['answer']}")
-        print(f"A (预期): {mh_answers[i]}")
-        print("-" * 20)
+        is_correct = check_answer(res["answer"], mh_answers[i], mh_aliases[i])
+        if is_correct: metrics["multi_hop_cot"]["correct"] += 1
+        
+        if TEST_MODE:
+            status = "✅ PASS" if is_correct else "❌ FAIL"
+            print(f"\n[Multi-hop CoT #{i}] {status}")
+            print(f"Q: {mh_prompts[i]}")
+            # Print last 200 chars of thinking to verify it worked
+            think_preview = res['thinking'][-200:] if len(res['thinking']) > 200 else res['thinking']
+            print(f"Think: ...{think_preview}")
+            print(f"Got: {res['answer']}")
+            print(f"Exp: {mh_answers[i]}")
 
-    # --- 5. 打印最终结果 ---
-    print("\n\n--- 评估完成：最终结果 ---")
-    
-    ew_acc = (metrics["edit_wise"]["correct"] / metrics["edit_wise"]["total"]) * 100
-    iw_acc = (metrics["instance_wise"]["correct"] / metrics["instance_wise"]["total"]) * 100
-    mh_acc = (metrics["multi_hop"]["correct"] / metrics["multi_hop"]["total"]) * 100
-    mh_cot_acc = (metrics["multi_hop_cot"]["correct"] / metrics["multi_hop_cot"]["total"]) * 100
+    # --- Print Stats ---
+    print("\n\n=== Final Results ===")
+    def calc_acc(key):
+        if metrics[key]["total"] == 0: return 0.0
+        return (metrics[key]["correct"] / metrics[key]["total"]) * 100
 
-    print(f"\n📊 MQUAKE 评估指标 (模型: {LORA_ADAPTER_PATH}):")
-    print("-" * 40)
-    print(f"1. Edit-wise (事实记忆):   {ew_acc:.2f}% ({metrics['edit_wise']['correct']} / {metrics['edit_wise']['total']})")
-    print(f"2. Instance-wise (链条记忆): {iw_acc:.2f}% ({metrics['instance_wise']['correct']} / {metrics['instance_wise']['total']})")
-    print(f"3. Multi-hop (非 CoT):     {mh_acc:.2f}% ({metrics['multi_hop']['correct']} / {metrics['multi_hop']['total']})")
-    print(f"4. Multi-hop (CoT/Thinking): {mh_cot_acc:.2f}% ({metrics['multi_hop_cot']['correct']} / {metrics['multi_hop_cot']['total']})")
-    print("-" * 40)
+    print(f"Edit-wise:   {calc_acc('edit_wise'):.2f}%")
+    print(f"Instance:    {calc_acc('instance_wise'):.2f}%")
+    print(f"Multi-hop:   {calc_acc('multi_hop'):.2f}%")
+    print(f"Multi-hop CoT: {calc_acc('multi_hop_cot'):.2f}%")
 
 if __name__ == "__main__":
     main()
