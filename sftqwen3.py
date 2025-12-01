@@ -14,8 +14,8 @@ from typing import Any, Dict, List
 # --- 1. 配置模型和 Tokenizer (和之前一样) ---
 
 model_name = "Qwen/Qwen3-8B"
-dataset_path = "/scratch/yw8866/MQuAKE/datasets/MQuAKE-T.json" 
-new_model_name = "qwen3-8b-implicit-knowledge-update"
+dataset_path = "/scratch/yw8866/MQuAKE/datasets/MQuAKE-CF-3k-v2.json" 
+new_model_name = "qwen3-8b-CF"
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -166,7 +166,7 @@ collator_with_debug = DataCollatorWithDebugging(tokenizer=tokenizer)
 
 training_args = TrainingArguments(
     output_dir=f"./{new_model_name}-results",
-    per_device_train_batch_size=32,
+    per_device_train_batch_size=8,
     gradient_accumulation_steps=4,
     learning_rate=2e-4,
     num_train_epochs=3,
